@@ -1,0 +1,1236 @@
+PROCEDURE CSRG_PROD.SP_BP_2_BATCH_PRICING_TRANS
+IS
+--
+-- OBJECTIVE:                       2-BATCH_PRICING_TRANS.sql
+-- PURPOSE:                         To replace 2-BATCH_PRICING_TRANS.sql script
+-- MODIFICATION HISTORY
+-- Person           Date            Comments
+-- ==============   ==============  ===================================================================================
+-- E.Falkov         11/03/2017      Original Version...
+-- ==============   ==============  ===================================================================================
+
+v_prc_nm               VARCHAR2(30)    := 'sp_bp_2_batch_pricing_trans';
+v_count                VARCHAR2(100);
+v_err_msg              VARCHAR2(4000);
+v_ddl_smt              VARCHAR2(32676) := NULL;
+v_tab_owner            VARCHAR2(100)   :='CSRG_PROD';
+v_tab1_name            VARCHAR2(100)   :='BPO_TMP_PART2_STEP1';
+v_tab2_name            VARCHAR2(100)   :='BPO_TMP_PART2_STEP2';
+v_tab3_name            VARCHAR2(100)   :='BPO_TMP_PART2_STEP3';
+v_tab4_name            VARCHAR2(100)   :='BATCH_PRICING_INPUT';
+v_tab5_name            VARCHAR2(100)   :='BPO_TMP_ACCT_MI';
+v_exec_status_id       NUMBER          := NULL;
+v_exec_status_txt      VARCHAR2(4000)  := NULL;
+v_job_run_id           NUMBER          := 0;
+v_job_name             VARCHAR2(40) := 'SP_BP_2_BATCH_PRICING_TRANS';
+
+v_exec_segment_timestamp        TIMESTAMP WITH TIME ZONE:= SYSTIMESTAMP;  
+v_exec_total_segment_timestamp  TIMESTAMP WITH TIME ZONE:= SYSTIMESTAMP;   
+v_runtime                       VARCHAR2(50):=NULL;
+
+temp_tab4              VARCHAR2(32000);
+
+BEGIN 
+v_exec_status_id:=0;
+v_exec_status_txt:='SUCCESS';
+v_exec_total_segment_timestamp := SYSTIMESTAMP;
+
+
+
+/*FOUR STEP PROCESS TO
+  --- 2.  CREATE A TABLE WITH ALL POSSIBLE COMBINATIONS OF TRANSACTIONS AND NEW PRODUCT (ECLIPSE PROD CD)
+  --- 3.  CREATE A TABLE WITH ALL VARIABLES NEEDED TO DETERMINE THE APPLICALBE LLPA'S
+  --- DELETE FROM THESE UNWANTED TRANSACTI0NS
+  --- DROP TEMPORARY TABLES (BPO_TMP_PART2_STEP1 AND BPO_TMP_PART2_STEP2)
+  --- USES CSRG_PROD.BATCH_PRICING_TRANSACTIONS AND CSRG_PROD.BATCH_PRICING_PRODUCTS WHERE ACTIVE_FLAG = 'Y'
+  --- ALSO LINKS TO BPO_INPUT_DATA AND OTHER RELEVANT TABLES FROM ECLIPSE
+*/
+
+
+--Questions for Anupam:
+--MI Endorsement date for FHA...does the old MI Endorse date matter, or would it be some future date?
+--Need to figure out how to get HI Bal limits for multi-unit properties.
+
+--------------------------------------------------------------------------------------------------------------
+-- Step 1:  Get extract from BPO_INPUT_DATA and calc key values related to rate/term and cashout refi's using HiBal and Jumbo limits
+
+-- efalkov
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 1:  Refresh BPO_TMP_PART2_STEP1 (BPO_INPUT_DATA extract)',null,null,null); -- logfile entry
+COMMIT;
+
+-- ==========================================================================================================================================
+EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_PART2_STEP1 DROP STORAGE'; 
+
+v_ddl_smt:='ALTER TABLE '||v_tab_owner||'.'||v_tab1_name||' NOLOGGING';
+EXECUTE IMMEDIATE v_ddl_smt;
+
+
+-- ==============================================================================================================
+-- Disable BPO_TMP_PART2_STEP1  Constraints: 
+-- ==============================================================================================================
+PKG_UTL_OBJMAINTENANCE.prc_disable_idx_constr_trig
+   (p_exec_status_id             => v_exec_status_id, 
+    p_exec_status_txt            => v_exec_status_txt,  
+    p_called_by                  => v_prc_nm,  
+    p_owner                      => v_tab_owner, -- CSRG_PROD
+    p_tab_name                   => v_tab1_name,  
+    p_disable_pk_yn              => 'Y', 
+    p_disable_unq_yn             => 'Y', 
+    p_disable_chk_yn             => 'N', 
+    p_disable_fk_yn              => 'N', 
+    p_disable_trig_yn            => 'N',
+    p_disable_pk_idx             => 'N',
+    p_disable_unq_idx            => 'N',
+    p_disable_part_idx           => NULL,  
+    p_disable_subpart_idx        => NULL,  
+    p_disable_other_idx          => 'Y',
+    p_part_idx_sch_pattern       => NULL,  
+    p_subpart_idx_sch_pattern    => NULL,
+    p_job_name                   => v_job_name,
+    p_job_run_id                 => v_job_run_id   
+   ); 
+   
+   
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+INSERT /*+ append */ INTO CSRG_PROD.BPO_TMP_PART2_STEP1 
+(  portfolio, servicing_source, account_number, 
+   loan_term, remaining_term, adj_remaining_term, 
+   unpaid_balance, interest_rate, principal_and_interest, 
+   agency_value, avm_value, avm_method, 
+   cur_ltv, flg_gse_value, state, 
+   prop_zip, number_of_units, occupancy_code, 
+   property_type_code, conf_loan_limit, hi_bal_loan_limit, 
+   fha_loan_limit, cash_out_avail, upb_2, 
+   origination_date, investor_full_name, rate_type, 
+   loan_type, product_type_code, cur_mi_type, 
+   cur_mi_amount, mi_endorse_dt, cur_mi_rate, 
+   harp_ind, flg_subprime, flg_ce, 
+   dq6_cnt, forebearance_flag, bk_mths_since, 
+   bankruptcy_disposition_desc, bankruptcy_code, ad_term, 
+   ad_term_exact_years, ad_term_co, subfi_amt, 
+   subchannel_id, entity_cd
+ )
+SELECT
+    L.PORTFOLIO,
+    L.SERVICING_SOURCE,
+    L.ACCOUNT_NUMBER,
+    L.LOAN_TERM,
+    L.REMAINING_TERM,
+    L.ADJ_REMAINING_TERM,
+    L.UNPAID_BALANCE,
+    L.INTEREST_RATE,
+    L.PRINCIPAL_AND_INTEREST,
+
+    -- Get both the Agency IPV and Corelogic AVMs...will determine later which to use as the CURRENT_PROPERTY_VALUE
+    -- Force to null if 0
+    decode(PV.AGENCY_VALUE,0,NULL,PV.AGENCY_VALUE) as AGENCY_VALUE,
+    decode(PV.AVM_VALUE,0,NULL,PV.AVM_VALUE)        as AVM_VALUE,
+    PV.AVM_METHOD,
+
+    L.LTV as CUR_LTV,
+    CASE WHEN L.CURRENT_PROP_VALUE_METHOD IN ('IPV', 'HVE') THEN 'N' ELSE 'Y' END AS FLG_GSE_VALUE,
+    L.PROP_STATE AS STATE,
+    L.PROP_ZIP,
+    L.NUMBER_OF_UNITS, -- ADDED BY AT 9/27/2013
+
+    L.CURRENT_OCCUPANCY_CODE AS OCCUPANCY_CODE, -- ADDED BY AT 10/11/2013
+    L.PROPERTY_TYPE_CODE AS PROPERTY_TYPE_CODE,
+    -- Can we assume the 4-unit limit applies to 5+ unit properties??
+    CASE WHEN NVL(L.NUMBER_OF_UNITS,0)<=1 THEN DECODE( L.PROP_STATE,'HI', 625500, 'AK',625500,417000)
+          WHEN L.NUMBER_OF_UNITS=2           THEN DECODE( L.PROP_STATE,'HI', 800775, 'AK',800775,533850)
+          WHEN L.NUMBER_OF_UNITS=3        THEN DECODE( L.PROP_STATE,'HI', 967950, 'AK',967950,645300)
+          WHEN L.NUMBER_OF_UNITS>=4       THEN DECODE( L.PROP_STATE,'HI',1202925, 'AK',1202925,801950)
+    END AS CONF_LOAN_LIMIT,
+
+    -- ***********Need to figure out how to get Hi Bal limits for multi-unit properties.************************
+        CASE WHEN NVL(L.NUMBER_OF_UNITS,0)<=1 THEN NVL(LIM.LOAN_LIMIT_1_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,417000) )
+          WHEN L.NUMBER_OF_UNITS=2               THEN NVL(LIM.LOAN_LIMIT_2_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,417000) )
+          WHEN L.NUMBER_OF_UNITS=3               THEN NVL(LIM.LOAN_LIMIT_3_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,417000) )
+          WHEN L.NUMBER_OF_UNITS>=4           THEN NVL(LIM.LOAN_LIMIT_4_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,417000) )
+    END AS HI_BAL_LOAN_LIMIT,
+
+        CASE WHEN NVL(L.NUMBER_OF_UNITS,0)<=1 THEN NVL(FLIM.LOAN_LIMIT_1_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,271050) )
+          WHEN L.NUMBER_OF_UNITS=2               THEN NVL(FLIM.LOAN_LIMIT_2_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,347000) )
+          WHEN L.NUMBER_OF_UNITS=3               THEN NVL(FLIM.LOAN_LIMIT_3_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,419425) )
+          WHEN L.NUMBER_OF_UNITS>=4           THEN NVL(FLIM.LOAN_LIMIT_4_UNIT,DECODE( PROP_STATE,'HI',625500, 'AK',625500,521250) )
+    END AS FHA_LOAN_LIMIT,
+
+    -- LTV Notes: Due to inaccuracies with AVM, we calc cash out using an LTV less than the max permissible per guidelines
+    -- If NUMBER_OF_UNITS is 0 or NULL, assume 1
+    -- Use AVM_VALUE as we cannot use Agency Value/IPV for Cash Out
+
+CASE WHEN NVL(AVM_VALUE,0)=0 THEN 0 -- If no AVM value, cannot offer cash out (or divide by zero)
+     WHEN NVL(NUMBER_OF_UNITS,0)<=1 THEN
+            GREATEST
+            (0,
+            LEAST(ROUND(.75*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,  DECODE( L.PROP_STATE,'HI',625500, 'AK',625500,417000)-L.UNPAID_BALANCE),    /*Conforming limit @ 75 LTV*/
+            LEAST(ROUND(.60*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,  NVL(LIM.LOAN_LIMIT_1_UNIT,417000)-L.UNPAID_BALANCE),     /*HIBAL limit @ 60 LTV*/
+            LEAST(350000, ROUND(.65*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,  1000000-L.UNPAID_BALANCE),                                   /*JUMBO limit @ 65 LTV capped @ 350K*/
+            LEAST(500000, ROUND(.60*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,  1500000-L.UNPAID_BALANCE),                                    /*JUMBO limit @ 60 LTV capped @ 500K*/
+            LEAST(500000, ROUND(.55*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,  2000000-L.UNPAID_BALANCE),                                   /*JUMBO limit @ 55 LTV capped @ 500K*/
+            LEAST(500000, ROUND(.45*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,  2500000-L.UNPAID_BALANCE),                                   /*JUMBO limit @ 45 LTV capped @ 500K*/
+            LEAST(500000, ROUND(.35*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,  3000000-L.UNPAID_BALANCE)                                       /*JUMBO limit @ 35 LTV capped @ 500K*/
+            )
+      WHEN L.NUMBER_OF_UNITS=2 THEN
+            GREATEST(0,        LEAST(  ROUND(.65*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,
+                    DECODE( L.PROP_STATE,'HI',800775, 'AK',800775,533850)-L.UNPAID_BALANCE )  /*Conforming limit @ 65 LTV*/                                            /*Only conforming applies*/
+            )
+      WHEN L.NUMBER_OF_UNITS=3 THEN
+            GREATEST(0,
+            LEAST(  ROUND(.65*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,
+                    DECODE( L.PROP_STATE,'HI',967950, 'AK',967950,645300)-L.UNPAID_BALANCE ) /*Conforming limit @ 65 LTV*/                                            /*Only conforming applies*/
+            )
+      WHEN L.NUMBER_OF_UNITS=4 THEN
+            GREATEST(0,
+            LEAST(  ROUND(.65*PV.AVM_VALUE,2)-L.UNPAID_BALANCE,
+                    DECODE( L.PROP_STATE,'HI',1202925, 'AK',1202925,801950)-L.UNPAID_BALANCE ) /*Conforming limit @ 65 LTV*/                                            /*Only conforming applies*/
+            )
+      ELSE 0 -- error check...no record should get this value
+END as CASH_OUT_AVAIL,
+
+    0 AS UPB_2,
+    L.ORIGINATION_DATE,
+    L.INVESTOR_FULL_NAME,
+    L.RATE_TYPE,
+    L.LOAN_TYPE,
+    L.PRODUCT_TYPE_CODE,
+    CASE WHEN L.BPMI_TYPE IN ('A', 'B', 'M', 'O') THEN 'BPMI'
+    WHEN L.LPMI_TYPE IN ('A', 'B', 'M', 'O') THEN 'LPMI'
+    WHEN L.IPMI_TYPE IN ('A', 'B', 'M', 'O') THEN 'IPMI'
+    ELSE NULL END AS CUR_MI_TYPE,
+    CASE WHEN L.BPMI_TYPE IN ('A', 'B', 'M', 'O') THEN BPMI_AMT
+    ELSE 0 END as CUR_MI_AMOUNT,
+    CASE WHEN L.BPMI_TYPE IN ('A', 'B', 'M', 'O') THEN BPMI_ENDORSEMENT_DATE
+    ELSE NULL END AS MI_ENDORSE_DT,
+
+    --ADDED BY AT 06/23/2015 TO DEFAULT MI RATES TO ZERO WHERE WHEN RATE IS NOT THERE OR RATE IS GREATER THAN 1%
+    CASE WHEN L.BPMI_TYPE IN ('A', 'B', 'O') THEN 0 ELSE
+         CASE WHEN L.BPMI_TYPE =  'M' AND L.BPMI_ANNUAL_RATE IS NOT NULL AND L.BPMI_ANNUAL_RATE <= .01 THEN ROUND(BPMI_ANNUAL_RATE * 100,5) ELSE 0 END END AS CUR_MI_RATE,
+
+
+    --'A' AS MI_RATE_TYPE, /*MI_RATE_TYPE FOR FHA STREAMLINE IS D WHEN THOSE PRODUCTS ARE IMPLEMENTED THIS CONDITION WILL CHANGE*/
+
+    -- ASK ANUPAM ABOUT THIS:
+--    CASE WHEN L.FLG_EA = 'Y' OR FLG_ALTA = 'Y' THEN '001' ELSE '000' END AS HARP_IND,
+                        case when FN.FLG_ALTA='Y' and FN.FLG_EA='Y' then '003'
+                             when FN.FLG_ALTA='Y' then '001'
+                             when FN.FLG_EA='Y' then '002'
+                             else '004' end as HARP_IND,
+    FN.FLG_SUBPRIME,
+    FN.FLG_CE,
+    L.DQ6_CNT,
+    L.FOREBEARANCE_FLAG,
+    ROUND(MONTHS_BETWEEN(TRUNC(SYSDATE),NVL(L.BANKRUPTCY_DISPOSITION_DATE, TO_DATE('01/01/1900','MM/DD/YYYY')))) AS BK_MTHS_SINCE,
+    L.BANKRUPTCY_DISPOSITION_DESC,
+    NVL(L.BANKRUPTCY_CODE,'N') AS BANKRUPTCY_CODE,
+    CASE WHEN L.ADJ_REMAINING_TERM <= 12*12.5 THEN 120
+     WHEN L.ADJ_REMAINING_TERM <= 12*17.5 THEN 180
+     WHEN L.ADJ_REMAINING_TERM <= 12*22.5 THEN 240
+     WHEN L.ADJ_REMAINING_TERM <= 12*27.5 THEN 300 -- Added by AT on 02/19/2016 to allow for a 25 yr RATE TERM illustration
+     ELSE 360
+END AS AD_TERM,
+
+FLOOR(L.ADJ_REMAINING_TERM/12)*12 AS AD_TERM_EXACT_YEARS,   -- Used with BPO_TRANSACTIONS table to create 'RATE TERM EXACT YEARS'
+
+CASE WHEN L.ADJ_REMAINING_TERM <= 120 THEN 120
+     WHEN L.ADJ_REMAINING_TERM <= 180 THEN 180
+     WHEN L.ADJ_REMAINING_TERM <= 240 THEN 240
+     ELSE 360
+END AS AD_TERM_CO,
+
+
+0  AS SUBFI_AMT,
+
+--case when CURRENT_FICO_PRIM is null or CURRENT_FICO_PRIM = 0 then 720 else CURRENT_FICO_PRIM end
+--CRED_SCORE, /*Removed on 5/15/2017 by AT
+SUBCHANNEL_ID,
+
+'NEWCO' AS ENTITY_CD
+
+FROM
+    CSRG_PROD.BPO_INPUT_DATA L,
+    (
+                SELECT DISTINCT
+                ZIP AS ZIP_CODE,
+                LIMIT_FOR_1_UNIT AS LOAN_LIMIT_1_UNIT,
+                LIMIT_FOR_2_UNIT AS LOAN_LIMIT_2_UNIT,
+                LIMIT_FOR_3_UNIT AS LOAN_LIMIT_3_UNIT,
+                LIMIT_FOR_4_UNIT AS LOAN_LIMIT_4_UNIT
+                FROM ENCOMPASS_BPO_LOAN_LIMITS A, ZIP_TO_FIPS B
+                WHERE A.CODE_5 = B.COUNTY_CODE
+                AND A.LOAN_TYPE = 'CONF'
+                AND B.RANK = 1
+    ) LIM,
+
+        (
+                SELECT DISTINCT
+                ZIP AS ZIP_CODE,
+                LIMIT_FOR_1_UNIT AS LOAN_LIMIT_1_UNIT,
+                LIMIT_FOR_2_UNIT AS LOAN_LIMIT_2_UNIT,
+                LIMIT_FOR_3_UNIT AS LOAN_LIMIT_3_UNIT,
+                LIMIT_FOR_4_UNIT AS LOAN_LIMIT_4_UNIT
+                FROM ENCOMPASS_BPO_LOAN_LIMITS A, ZIP_TO_FIPS B
+                WHERE A.CODE_5 = B.COUNTY_CODE
+                AND A.LOAN_TYPE = 'FHA'
+                AND B.RANK = 1
+    ) FLIM,
+
+    BPO_TMP_PROP_VALUES PV,
+    (
+    SELECT
+    FNMA_LN,
+    MAX(EA_FLG) AS FLG_EA,
+    MAX(ALTA_FLG) AS FLG_ALTA,
+    MAX(SUBPRIME_FLG) AS FLG_SUBPRIME,
+    MAX(CE_FLG) AS FLG_CE
+    FROM STREAMLINE_HARP_FNMA_SOL
+    GROUP BY
+    FNMA_LN
+    ) FN
+    --,SOLICITATION_HISTORY_T SHT                 -- Used to run only for loans in SHT
+
+WHERE
+    --L.ACCOUNT_NUMBER=SHT.ACCOUNT_NUMBER and    -- Used to run only for loans in SHT
+    L.PROP_ZIP = LIM.ZIP_CODE(+)
+    AND L.PROP_ZIP = FLIM.ZIP_CODE(+)
+    AND L.SERVICING_SOURCE=PV.SERVICING_SOURCE(+)
+    AND L.ACCOUNT_NUMBER=PV.ACCOUNT_NUMBER(+)
+    AND L.INVESTOR_LOAN_NO = FN.FNMA_LN(+)
+    AND L.LIEN_POSITION ='01'
+    AND L.LOAN_STATUS_CODE in ('1','9')
+    AND (PV.AGENCY_VALUE>0 or PV.AVM_VALUE>0)
+    AND L.INTEREST_RATE > 0
+    AND L.PRINCIPAL_AND_INTEREST > 0
+    AND (
+         NVL(BANKRUPTCY_CODE,'N') <> 'C' OR
+        (BANKRUPTCY_CODE = 'C' AND NVL(BANKRUPTCY_DISPOSITION_DESC,'Z') IN ('A', 'B', 'C', 'D', 'I', 'J', 'K', 'L', 'M', 'P', 'Q', 'T', 'U', 'V', 'W', 'X'))
+        ) --exclude Closed B/K that should not be priced
+
+
+    --AND substr(L.ACCOUNT_NUMBER,5,1)='1'
+    --and ROWNUM < 1000
+    --AND L.PORTFOLIO IN ('RESCAP')
+    --and L.account_number IN ('620087106', '620290171', '196007751')
+    --and UNPAID_BALANCE>400000
+    --and UNPAID_BALANCE > DECODE( STATE,'HI',625500, 'AK',625500,417000)
+    --and UNPAID_BALANCE > NVL(LIM.CONFORMING_ONE_UNIT_LOAN_LIMIT,417000)
+;
+ 
+v_count := SQL%ROWCOUNT;
+
+
+
+--SELECT * FROM BPO_TMP_PART2_STEP1 WHERE ROWNUM < 10 ;
+
+-- 1. Enable Constraints, Validate Indexes On BPO_TMP_PART2_STEP1 Table .....
+-- =======================================================================================================================================
+    PKG_UTL_OBJMAINTENANCE.prc_enable_idx_constr
+            (p_exec_status_id   => v_exec_status_id, 
+             p_exec_status_txt  => v_exec_status_txt, 
+             p_called_by        => v_prc_nm, 
+             p_load_table_name  => v_tab1_name,
+             p_job_name         => NULL,
+             p_job_run_id       => NULL
+             ); 
+             
+-- 2. Analyze Indexes On BPO_TMP_PART2_STEP1 Table .....
+-- =======================================================================================================================================            
+    PKG_UTL_OBJMAINTENANCE.prc_analyze_tab
+        (p_table_owner                  => v_tab_owner,
+         p_table_name                   => v_tab1_name, -- 'BPO_TMP_PART2_STEP1'
+         p_parallel_degree              => 4, 
+         p_method_opt                   => 'FOR ALL INDEXED COLUMNS SIZE AUTO', 
+         p_partition_yn                 => 'N',
+         p_sub_partition_yn             => 'N',
+         p_min_partition_refresh_year   => NULL,
+         p_max_partition_refresh_year   => NULL,
+         p_job_name                     => NULL,
+         p_job_run_id                   => NULL
+         );  
+         
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+
+INSERT INTO CSRG_PROD.BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 1:  Refresh BPO_TMP_PART2_STEP1 Complete.  # Records: ',
+                    v_count,v_tab1_name,v_runtime); -- logfile entry
+COMMIT;         
+         
+                  
+--------------------------------------------------------------------------------------------------------------
+-- Step 2:  Create various transaction shell records for each loan using records in BATCH_PRICING_TRANSACTIONS
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 2:  Refresh BPO_TMP_PART2_STEP2 (Transaction Shell Records)',null,null,null); -- logfile entry
+COMMIT;
+
+-- ==========================================================================================================================================
+EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_PART2_STEP2 DROP STORAGE'; 
+
+v_ddl_smt:='ALTER TABLE '||v_tab_owner||'.'||v_tab2_name||' NOLOGGING';
+EXECUTE IMMEDIATE v_ddl_smt;
+
+
+-- ==============================================================================================================
+-- Disable BPO_TMP_PART2_STEP2  Constraints: 
+-- ==============================================================================================================
+PKG_UTL_OBJMAINTENANCE.prc_disable_idx_constr_trig
+   (p_exec_status_id             => v_exec_status_id, 
+    p_exec_status_txt            => v_exec_status_txt,  
+    p_called_by                  => v_prc_nm,  
+    p_owner                      => v_tab_owner, -- CSRG_PROD
+    p_tab_name                   => v_tab2_name,  
+    p_disable_pk_yn              => 'Y', 
+    p_disable_unq_yn             => 'Y', 
+    p_disable_chk_yn             => 'N', 
+    p_disable_fk_yn              => 'N', 
+    p_disable_trig_yn            => 'N',
+    p_disable_pk_idx             => 'N',
+    p_disable_unq_idx            => 'N',
+    p_disable_part_idx           => NULL,  
+    p_disable_subpart_idx        => NULL,  
+    p_disable_other_idx          => 'Y',
+    p_part_idx_sch_pattern       => NULL,  
+    p_subpart_idx_sch_pattern    => NULL,
+    p_job_name                   => NULL,
+    p_job_run_id                 => NULL   
+   ); 
+
+
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+INSERT /*+ append */ INTO CSRG_PROD.BPO_TMP_PART2_STEP2 
+(
+   portfolio, servicing_source, account_number, 
+   loan_term, remaining_term, adj_remaining_term, 
+   unpaid_balance, interest_rate, principal_and_interest, 
+   agency_value, avm_value, avm_method, 
+   cur_ltv, flg_gse_value, state, 
+   prop_zip, number_of_units, occupancy_code, 
+   property_type_code, conf_loan_limit, hi_bal_loan_limit, 
+   fha_loan_limit, cash_out_avail, upb_2, 
+   origination_date, investor_full_name, rate_type, 
+   loan_type, product_type_code, cur_mi_type, 
+   cur_mi_amount, mi_endorse_dt, cur_mi_rate, 
+   harp_ind, flg_subprime, flg_ce, 
+   dq6_cnt, forebearance_flag, bk_mths_since, 
+   bankruptcy_disposition_desc, bankruptcy_code, ad_term, 
+   ad_term_exact_years, ad_term_co, subfi_amt, 
+   subchannel_id, entity_cd, transaction, 
+   new_term, harp_eligible_trans, strl_eligible_trans, 
+   fha_eligible_trans, conv_eligible_trans, new_loan_amt_tier, 
+   tier_cd, loan_amt, min_price_bump
+)
+SELECT
+    LOANS.*,
+    TRAN.TRANSACTION,
+    DECODE(TRAN.TRANSACTION,'RATE TERM EXACT YEARS',AD_TERM_EXACT_YEARS,TRAN.NEW_TERM) as NEW_TERM,
+
+    case when (FLG_GSE_VALUE='N' or SERVICING_SOURCE in ('MAN')) -- HARP Eligible (or assume all Quicken are HARP Eligible0
+            and TRAN.TRANSACTION not like '%CASHOUT%'    -- No Cashout allowed under HARP
+            and LOANS.UNPAID_BALANCE<=HI_BAL_LOAN_LIMIT  -- Conforming or Hi Bal, but no Jumbos under HARP
+            and NVL(LOANS.FLG_SUBPRIME,'N') = 'N'
+            and NVL(LOANS.FLG_CE,'N') = 'N'
+            --and LOANS.FOREBEARANCE_FLAG <> 'Y' -- Removed by Anupam Tripathi on 2/24/2017 per Karen Derrick
+            and LOANS.DQ6_CNT = 0
+            and NVL(LOANS.CUR_MI_TYPE,'N') NOT IN ('LPMI', 'IPMI')
+            and (LOANS.CUR_MI_TYPE IS NULL OR (LOANS.CUR_MI_TYPE = 'BPMI' AND NVL(LOANS.CUR_MI_AMOUNT,0) < 1000))
+            and (LOANS.BANKRUPTCY_CODE <> 'C' OR BK_MTHS_SINCE > 0)
+         then 'Y' else 'N'
+         end as HARP_ELIGIBLE_TRANS,
+
+    case when LOAN_TYPE = 'F'
+          and (LOANS.BANKRUPTCY_CODE <> 'C' OR BK_MTHS_SINCE > 24)
+          and LOANS.UNPAID_BALANCE <= FHA_LOAN_LIMIT
+    THEN 'Y' ELSE 'N' END AS STRL_ELIGIBLE_TRANS,
+
+    case when  (LOANS.BANKRUPTCY_CODE <> 'C' OR BK_MTHS_SINCE > 24)
+          and LOANS.UNPAID_BALANCE <= FHA_LOAN_LIMIT
+    THEN 'Y' ELSE 'N' END AS FHA_ELIGIBLE_TRANS,
+
+    case when  (LOANS.BANKRUPTCY_CODE <> 'C' OR BK_MTHS_SINCE > 48)
+          THEN 'Y' ELSE 'N' END AS CONV_ELIGIBLE_TRANS,
+
+    -- LOAN_AMT_TIER is CONF, HBAL, or JUMBO for ease of later processing.
+    case when LOANS.UNPAID_BALANCE + DECODE(TRAN.TRANSACTION,'CASHOUT 80 LTV',LOANS.CASH_OUT_AVAIL,0) > HI_BAL_LOAN_LIMIT then 'JUMBO'
+         when LOANS.UNPAID_BALANCE + DECODE(TRAN.TRANSACTION,'CASHOUT 80 LTV',LOANS.CASH_OUT_AVAIL,0) > CONF_LOAN_LIMIT then 'HBAL'
+         else 'CONF' end as NEW_LOAN_AMT_TIER,
+
+    -- TIER_CD is either CONF or JUMB.  JUMB includes Jumbo and Hi Balance
+    CASE WHEN LOANS.UNPAID_BALANCE + DECODE(TRAN.TRANSACTION,'CASHOUT 80 LTV',LOANS.CASH_OUT_AVAIL,0) > DECODE( STATE,'HI',625500, 'AK',625500,417000) THEN 'JUMB'
+         ELSE 'CONF' END AS TIER_CD,
+
+    -- Must use field name LOAN_AMT for NEW_LOAN_AMT now as it is used in the Eclipse LLPA conditions as 'LOAN_AMT'. Ditto for LTV and CLTV
+    LOANS.UNPAID_BALANCE + DECODE(TRAN.TRANSACTION,'CASHOUT 80 LTV',LOANS.CASH_OUT_AVAIL,0) AS LOAN_AMT,
+    TRAN.MIN_PRICE_BUMP
+
+FROM
+    BPO_TMP_PART2_STEP1 LOANS,
+    BATCH_PRICING_TRANSACTIONS TRAN
+WHERE
+    -- Cashout Transaction only available when CASH_OUT_AVAIL>0
+    -- Exact Years Transaction only available between 8 and 30 years (96 and 360 months)
+
+    (CASE WHEN LOANS.SERVICING_SOURCE = 'ACQ' THEN TRAN.ACTIVE_FLAG_ACQ ELSE TRAN.ACTIVE_FLAG_RET END) = 'Y'
+    and (
+    ( TRAN.TRANSACTION in ('RATE TERM REFINANCE','TERM EXTENDER','TERM REDUCER') and TRAN.REM_TERM = LOANS.AD_TERM)
+      or
+    ( TRAN.TRANSACTION = 'CASHOUT 80 LTV'  and LOANS.CASH_OUT_AVAIL>0              and TRAN.REM_TERM = LOANS.AD_TERM_CO)
+      or
+    ( TRAN.TRANSACTION = 'RATE TERM EXACT YEARS' and LOANS.AD_TERM_EXACT_YEARS between 96 and 360 )
+    )
+;
+
+v_count := SQL%ROWCOUNT;
+
+
+
+
+
+-- 1. Enable Constraints, Validate Indexes On BPO_TMP_PART2_STEP1 Table .....
+-- =======================================================================================================================================
+    PKG_UTL_OBJMAINTENANCE.prc_enable_idx_constr
+            (p_exec_status_id   => v_exec_status_id, 
+             p_exec_status_txt  => v_exec_status_txt, 
+             p_called_by        => v_prc_nm, 
+             p_load_table_name  => v_tab2_name,
+             p_job_name         => NULL,
+             p_job_run_id       => NULL
+             ); 
+             
+-- 2. Analyze Indexes On BPO_TMP_PART2_STEP2 Table .....
+-- =======================================================================================================================================            
+    PKG_UTL_OBJMAINTENANCE.prc_analyze_tab
+        (p_table_owner                  => v_tab_owner,
+         p_table_name                   => v_tab2_name, -- 'BPO_TMP_PART2_STEP1'
+         p_parallel_degree              => 4, 
+         p_method_opt                   => 'FOR ALL INDEXED COLUMNS SIZE AUTO', 
+         p_partition_yn                 => 'N',
+         p_sub_partition_yn             => 'N',
+         p_min_partition_refresh_year   => NULL,
+         p_max_partition_refresh_year   => NULL,
+         p_job_name                     => NULL,
+         p_job_run_id                   => NULL
+         );  
+         
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+
+
+INSERT INTO CSRG_PROD.BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 2:  Refresh Complete.Shell records created.  # Records: ',
+                    v_count,v_tab2_name,v_runtime); -- logfile entry
+COMMIT;
+
+          
+            
+--------------------------------------------------------------------------------------------------------------
+-- Step 3:  Creates a table of all llpa variables from batch_pricing_products and other product tables from eclipse
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 3:  Refresh BPO_TMP_PART2_STEP3 (Product List)',null,null,null); -- logfile entry
+COMMIT;
+
+-- ==========================================================================================================================================
+EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_PART2_STEP3 DROP STORAGE'; 
+
+v_ddl_smt:='ALTER TABLE '||v_tab_owner||'.'||v_tab3_name||' NOLOGGING';
+EXECUTE IMMEDIATE v_ddl_smt;
+
+-- NO NEED to DISABLE, ENABLE INDEXES and ANALYZE - small table
+
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+INSERT /*+ append */ INTO CSRG_PROD.BPO_TMP_PART2_STEP3 
+(
+   eng_prod_cd, prod_descript, prog_typ, 
+   tier_cd, bld_style, fnma_cred_score_yn, 
+   prop_typ, affinity_reltn_cd, tax_waive, 
+   type_cd, use_cd, purp_cd, 
+   rlock_cd, promo_cd, min_ltv, 
+   max_ltv, min_term, max_term, 
+   investor_restrict, org_date_restrict, trans_restrict, 
+   active_flag, loan_amt_tier, campaign_product_name, 
+   mi_rate_type, fee_gt, fee_dt, 
+   product_name, product_term, harp_product_flag, 
+   prod_cd, am_typ, be_ratio, 
+   chan_cd, mort_typ, proc_typ, 
+   first_adj, first_inc, sec_adj, 
+   sec_inc, margin, indx, 
+   life_cap, prod_group_eligibility, pricing_code, 
+   cred_score, 
+   min_product_pts
+)
+SELECT eng_prod_cd, 
+       prod_descript, 
+       prog_typ, 
+       tier_cd, 
+       bld_style, 
+       fnma_cred_score_yn, 
+       prop_typ, 
+       affinity_reltn_cd, 
+       tax_waive, 
+       type_cd, 
+       use_cd, 
+       purp_cd, 
+       rlock_cd, 
+       promo_cd, 
+       min_ltv, 
+       max_ltv, 
+       min_term, 
+       max_term, 
+       investor_restrict, 
+       org_date_restrict, 
+       trans_restrict, 
+       active_flag, 
+       loan_amt_tier, 
+       campaign_product_name, 
+       mi_rate_type, 
+       fee_gt, 
+       fee_dt, 
+       product_name, 
+       product_term, 
+       harp_product_flag, 
+       prod_cd, 
+       am_typ, 
+       be_ratio, 
+       chan_cd, 
+       mort_typ, 
+       proc_typ, 
+       first_adj, 
+       first_inc, 
+       sec_adj, 
+       sec_inc, 
+       margin, 
+       indx, 
+       life_cap,
+       prod_group_eligibility, 
+       pricing_code, 
+       cred_score,
+       min_product_pts
+FROM CSRG_PROD.BATCH_PRICING_PRODUCTS BP_PROD 
+WHERE active_flag = 'Y';     
+
+v_count := SQL%ROWCOUNT;
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+
+
+INSERT INTO CSRG_PROD.BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 3:  Refresh BPO_TMP_PART2_STEP3 Complete.  # Records: ',
+                    v_count,v_tab3_name,v_runtime); -- logfile entry
+COMMIT;
+
+
+--efalkov
+
+    -- **********************   TEMPORARY EXCLUSION OF FHA PRODUCTS   ************************************
+    --and BP_PROD.PROD_DESCRIPT not like '%FHA%'
+
+
+--select * from  BPO_TMP_PART2_STEP3;
+
+
+
+--------------------------------------------------------------------------------------------------------------
+-- Step 4: Join transaction shell records (BPO_TMP_PART2_STEP2) to the batch pricing product records (BPO_TMP_PART2_STEP3)
+-- to create BATCH_PRICING_INPUT which has all transactions and product combinations for each loan
+
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 4:  Refresh BATCH_PRICING_INPUT',null,null,null); -- logfile entry
+COMMIT;
+
+-- ==========================================================================================================================================
+EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BATCH_PRICING_INPUT DROP STORAGE'; 
+
+v_ddl_smt:='ALTER TABLE '||v_tab_owner||'.'||v_tab4_name||' NOLOGGING';
+EXECUTE IMMEDIATE v_ddl_smt;
+
+v_ddl_smt:='ALTER SESSION ENABLE PARALLEL DML';
+EXECUTE IMMEDIATE v_ddl_smt;
+
+INSERT /*+ append PARALLEL(6)*/ INTO BATCH_PRICING_INPUT
+(  PORTFOLIO,
+   SERVICING_SOURCE,
+   ACCOUNT_NUMBER,
+   UNPAID_BALANCE,
+   PRINCIPAL_AND_INTEREST,
+   INTEREST_RATE,
+   ADJ_REMAINING_TERM,
+   CURRENT_PROPERTY_VALUE,
+   CURRENT_PROPERTY_METHOD,
+   TRANSACTION,
+   NEW_PRODUCT,
+   HARP_ELIGIBLE_TRANS,
+   CONF_LOAN_LIMIT,
+   HI_BAL_LOAN_LIMIT,
+   FHA_LOAN_LIMIT,
+   LOAN_AMT,
+   NEW_LOAN_AMT_TIER,
+   LTV,
+   CLTV,
+   P_STATE,
+   PROP_ZIP,
+   SUBFI_AMT,
+   AD_TERM,
+   NEW_TERM,
+   TERM,
+   INVESTOR_FULL_NAME,
+   REFI_CD,
+   PRODUCT_TYPE_CODE,
+   CUR_MI_TYPE,
+   CUR_MI_AMOUNT,
+   CUR_MI_RATE,
+   MI_ENDORSE_DT, 
+   HARP_IND,
+   ENTITY_CD,
+   SUBCHANNEL_ID,
+   NUMBER_OF_UNITS, 
+   OCCUPANCY_CODE, 
+   PROPERTY_TYPE_CODE,
+   ORIGINATION_FEE,
+   ENG_PROD_CD, 
+   PROD_DESCRIPT, 
+   PROG_TYP, 
+   TIER_CD, 
+   BLD_STYLE, 
+   FNMA_CRED_SCORE_YN, 
+   PROP_TYP,
+   AFFINITY_RELTN_CD, 
+   TAX_WAIVE, 
+   TYPE_CD, 
+   USE_CD,
+   PURP_CD, 
+   RLOCK_CD, 
+   PROMO_CD, 
+   MIN_LTV, 
+    MAX_LTV, 
+    MIN_TERM, 
+    MAX_TERM, 
+    INVESTOR_RESTRICT, 
+    ORG_DATE_RESTRICT, 
+    TRANS_RESTRICT, 
+    ACTIVE_FLAG, 
+    LOAN_AMT_TIER, 
+    CAMPAIGN_PRODUCT_NAME, 
+    MI_RATE_TYPE, 
+    FEE_GT, 
+    FEE_DT, 
+    PRODUCT_NAME, 
+    PRODUCT_TERM, 
+    HARP_PRODUCT_FLAG, 
+    PROD_CD, 
+    AM_TYP, 
+    BE_RATIO, 
+    CHAN_CD, 
+    MORT_TYP, 
+    PROC_TYP, 
+    FIRST_ADJ, 
+    FIRST_INC, 
+    SEC_ADJ, 
+    SEC_INC, 
+    MARGIN, 
+    INDX, 
+    LIFE_CAP, 
+    PROD_GROUP_ELIGIBILITY, 
+    PRICING_CODE, 
+    CRED_SCORE,
+    NEW_UFMIP_PCT,
+    NEW_MIP_PCT,
+    MIN_PTS
+)
+SELECT /*+ PARALLEL(6) */ 
+    A.PORTFOLIO,
+    A.SERVICING_SOURCE,
+    A.ACCOUNT_NUMBER,
+    A.UNPAID_BALANCE,
+    A.PRINCIPAL_AND_INTEREST,
+    A.INTEREST_RATE,
+    A.ADJ_REMAINING_TERM,
+    decode(B.PROD_GROUP_ELIGIBILITY,'H',nvl(AGENCY_VALUE,AVM_VALUE),AVM_VALUE) AS CURRENT_PROPERTY_VALUE,
+    decode(B.PROD_GROUP_ELIGIBILITY,'H',case when AGENCY_VALUE>0 then case when investor_full_name = 'FANNIE MAE' then 'IPV' else 'HVE' end else AVM_METHOD end,AVM_METHOD) AS CURRENT_PROPERTY_METHOD,
+    A.TRANSACTION,
+    (A.NEW_TERM/12) || ' YR ' || B.PROD_DESCRIPT AS NEW_PRODUCT,
+    A.HARP_ELIGIBLE_TRANS,
+    A.CONF_LOAN_LIMIT,
+    A.HI_BAL_LOAN_LIMIT,
+    A.FHA_LOAN_LIMIT,
+    A.LOAN_AMT,
+    A.NEW_LOAN_AMT_TIER,
+    100*ROUND( LOAN_AMT / decode(B.PROD_GROUP_ELIGIBILITY,'H',nvl(AGENCY_VALUE,AVM_VALUE),AVM_VALUE) ,4) AS LTV,
+    100*ROUND( LOAN_AMT / decode(B.PROD_GROUP_ELIGIBILITY,'H',nvl(AGENCY_VALUE,AVM_VALUE),AVM_VALUE) ,4) AS CLTV,
+    --A.CRED_SCORE,--Removed on 5/15/2017 by AT
+    A.STATE AS P_STATE,
+    A.PROP_ZIP,
+    A.SUBFI_AMT,
+    A.AD_TERM,
+    A.NEW_TERM,
+    A.NEW_TERM AS TERM,
+    A.INVESTOR_FULL_NAME,
+    CASE WHEN A.TRANSACTION = 'CASHOUT 80 LTV' THEN 'CO' ELSE 'LC' END AS REFI_CD,
+    A.PRODUCT_TYPE_CODE,
+    A.CUR_MI_TYPE,
+    A.CUR_MI_AMOUNT,
+    A.CUR_MI_RATE,
+    --A.MI_RATE_TYPE,
+    CASE WHEN A.MI_ENDORSE_DT IS NULL THEN A.ORIGINATION_DATE + 60 ELSE A.MI_ENDORSE_DT END AS MI_ENDORSE_DT,  --Added to price FHA in case Endorsement date is missing
+    A.HARP_IND,
+    A.ENTITY_CD,
+    A.SUBCHANNEL_ID,
+    A.NUMBER_OF_UNITS, --ADDED BY AT 9/27/2013
+    A.OCCUPANCY_CODE, -- ADDED BY AT 10/11/2013,
+    A.PROPERTY_TYPE_CODE,
+    CASE WHEN A.SERVICING_SOURCE = 'ACQ' THEN FEE_DT ELSE FEE_GT END AS ORIGINATION_FEE,
+    B.ENG_PROD_CD, 
+    B.PROD_DESCRIPT, 
+    B.PROG_TYP, 
+    B.TIER_CD, 
+    B.BLD_STYLE, 
+    B.FNMA_CRED_SCORE_YN, 
+    CASE WHEN A.PROPERTY_TYPE_CODE = '016' THEN 'COND' WHEN A.PROPERTY_TYPE_CODE = '081' THEN 'MANU' ELSE CASE WHEN A.NUMBER_OF_UNITS > 1 THEN CAST(A.NUMBER_OF_UNITS AS VARCHAR(5)) ELSE B.PROP_TYP END END AS PROP_TYP,
+    B.AFFINITY_RELTN_CD, 
+    B.TAX_WAIVE, 
+    B.TYPE_CD, 
+    CASE WHEN NVL(A.OCCUPANCY_CODE,1) = '1' THEN 'P' WHEN A.OCCUPANCY_CODE = '2' THEN 'S' ELSE 'I' END AS USE_CD,
+    B.PURP_CD, 
+    B.RLOCK_CD, 
+    B.PROMO_CD, 
+    B.MIN_LTV, 
+    B.MAX_LTV, 
+    B.MIN_TERM, 
+    B.MAX_TERM, 
+    B.INVESTOR_RESTRICT, 
+    B.ORG_DATE_RESTRICT, 
+    B.TRANS_RESTRICT, 
+    B.ACTIVE_FLAG, 
+    B.LOAN_AMT_TIER, 
+    B.CAMPAIGN_PRODUCT_NAME, 
+    B.MI_RATE_TYPE, 
+    B.FEE_GT, 
+    B.FEE_DT, 
+    B.PRODUCT_NAME, 
+    B.PRODUCT_TERM, 
+    B.HARP_PRODUCT_FLAG, 
+    B.PROD_CD, 
+    B.AM_TYP, 
+    B.BE_RATIO, 
+    B.CHAN_CD, 
+    B.MORT_TYP, 
+    B.PROC_TYP, 
+    B.FIRST_ADJ, 
+    B.FIRST_INC, 
+    B.SEC_ADJ, 
+    B.SEC_INC, 
+    B.MARGIN, 
+    B.INDX, 
+    B.LIFE_CAP, 
+    B.PROD_GROUP_ELIGIBILITY, 
+    B.PRICING_CODE, 
+    B.CRED_SCORE,
+    0.0 AS NEW_UFMIP_PCT,
+    0.0 AS NEW_MIP_PCT,
+    B.MIN_PRODUCT_PTS + A.MIN_PRICE_BUMP AS MIN_PTS   --fixed Anupam code from c.MIN_PRICE_BUMP to a.MIN_PRICE_BUMP
+FROM
+    BPO_TMP_PART2_STEP2 A,
+    BPO_TMP_PART2_STEP3 B
+WHERE
+        A.NEW_TERM between B.MIN_TERM and B.MAX_TERM
+    AND (100*ROUND( LOAN_AMT / decode(B.PROD_GROUP_ELIGIBILITY,'H',nvl(AGENCY_VALUE,AVM_VALUE),AVM_VALUE) ,4)) between  B.MIN_LTV and B.MAX_LTV
+    AND (B.INVESTOR_RESTRICT IS NULL OR B.INVESTOR_RESTRICT = A.INVESTOR_FULL_NAME)
+    AND (B.ORG_DATE_RESTRICT IS NULL OR B.ORG_DATE_RESTRICT >= A.ORIGINATION_DATE)
+    AND A.TIER_CD = B.TIER_CD
+    AND (B.TRANS_RESTRICT IS NULL OR (B.TRANS_RESTRICT = 'CO' AND A.TRANSACTION <> 'CASHOUT 80 LTV'))
+    AND A.NEW_LOAN_AMT_TIER=B.LOAN_AMT_TIER
+    AND (
+       (A.HARP_ELIGIBLE_TRANS = 'Y' AND B.PROD_GROUP_ELIGIBILITY = 'H') or
+       (A.STRL_ELIGIBLE_TRANS = 'Y' /*AND A.HARP_ELIGIBLE_TRANS = 'N'*/ AND B.PROD_GROUP_ELIGIBILITY = 'S') or
+       (A.FHA_ELIGIBLE_TRANS = 'Y' /*AND A.HARP_ELIGIBLE_TRANS = 'N'*/ AND A.STRL_ELIGIBLE_TRANS = 'N' AND B.PROD_GROUP_ELIGIBILITY = 'F') or
+       (A.CONV_ELIGIBLE_TRANS = 'Y' /*AND A.HARP_ELIGIBLE_TRANS = 'N' AND A.STRL_ELIGIBLE_TRANS = 'N'*/ AND B.PROD_GROUP_ELIGIBILITY = 'C')
+       )
+;
+v_count := SQL%ROWCOUNT;
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+INSERT INTO CSRG_PROD.BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 4:  Refresh '||v_tab4_name||' Complete.  # Records: ',
+                    v_count,v_tab4_name,v_runtime); -- logfile entry
+COMMIT;
+
+--select * from BATCH_PRICING_INPUT where account_number='62003074';
+
+--ADDED BY AT 9/27/2013 TO USE NUMBER OF UNITS AND OCCUPANCY FROM LOAN MASTER
+--v_exec_segment_timestamp := SYSTIMESTAMP;
+
+-- E.Falkov move UPDATE to main insert above
+
+--UPDATE BATCH_PRICING_INPUT
+--SET PROP_TYP = CASE WHEN PROPERTY_TYPE_CODE = '016' THEN 'COND' WHEN PROPERTY_TYPE_CODE = '081' THEN 'MANU' ELSE CASE WHEN NUMBER_OF_UNITS > 1 THEN CAST(NUMBER_OF_UNITS AS VARCHAR(5)) ELSE PROP_TYP END END,
+--USE_CD = (CASE WHEN NVL(OCCUPANCY_CODE,1) = '1' THEN 'P' WHEN OCCUPANCY_CODE = '2' THEN 'S' ELSE 'I' END);
+--
+--
+--v_count := SQL%ROWCOUNT;
+--
+--v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+--
+--INSERT INTO CSRG_PROD.BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 4a:  UPDATE PROP_TYP and USE_CD'||v_tab4_name||' Complete.  # Records: ',
+--                    v_count,v_tab4_name,v_runtime); -- logfile entry
+--COMMIT;
+
+
+
+--------------------------------------------------------------------------------------------------------------
+-- Step 5a: Process MI rates for FHA, IRRRL and PMI products
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 5:  Refresh BPO_TMP_ACCT_MI (MI Factors)',null,null,null); -- logfile entry
+COMMIT;
+--
+
+--ADDED BY AT 06/23/2015 TO UPDATE MI_TYPE AND CURRENT MI FOR HARP OVER 80LTV LOANS WHERE MI RATE IS AVAILABLE
+--THIS WILL REQUIRE A REVIEW ONCE SERVICING DATA FOR BPMI IS CLEANER
+
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+UPDATE BATCH_PRICING_INPUT
+SET NEW_MIP_PCT =   (CASE WHEN CUR_MI_RATE > 0 AND CUR_MI_TYPE = 'BPMI' AND NEW_PRODUCT LIKE ('%HASP%') AND LTV >= 80 THEN CUR_MI_RATE ELSE 0.0 END),
+    MI_RATE_TYPE =  (CASE WHEN CUR_MI_RATE = 0 AND CUR_MI_TYPE = 'BPMI' AND NEW_PRODUCT LIKE ('%HASP%') AND LTV >= 80 THEN 'P' ELSE MI_RATE_TYPE END);
+COMMIT;
+
+v_count := SQL%ROWCOUNT;
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+
+INSERT INTO CSRG_PROD.BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 5a:  UPDATE NEW_MIP_PCT and MI_RATE_TYPE'||v_tab4_name||' Complete.  # Records: ',
+                    v_count,v_tab4_name,v_runtime); -- logfile entry
+COMMIT;
+
+-- ==========================================================================================================================================
+EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_ACCT_MI DROP STORAGE'; 
+
+v_ddl_smt:='ALTER TABLE '||v_tab_owner||'.'||v_tab5_name||' NOLOGGING';
+EXECUTE IMMEDIATE v_ddl_smt;
+
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+-- ==============================================================================================================
+-- Disable BPO_TMP_ACCT_MI  Constraints: 
+-- ==============================================================================================================
+PKG_UTL_OBJMAINTENANCE.prc_disable_idx_constr_trig
+   (p_exec_status_id             => v_exec_status_id, 
+    p_exec_status_txt            => v_exec_status_txt,  
+    p_called_by                  => v_prc_nm,  
+    p_owner                      => v_tab_owner, -- CSRG_PROD
+    p_tab_name                   => v_tab5_name,  
+    p_disable_pk_yn              => 'Y', 
+    p_disable_unq_yn             => 'Y', 
+    p_disable_chk_yn             => 'N', 
+    p_disable_fk_yn              => 'N', 
+    p_disable_trig_yn            => 'N',
+    p_disable_pk_idx             => 'N',
+    p_disable_unq_idx            => 'N',
+    p_disable_part_idx           => NULL,  
+    p_disable_subpart_idx        => NULL,  
+    p_disable_other_idx          => 'Y',
+    p_part_idx_sch_pattern       => NULL,  
+    p_subpart_idx_sch_pattern    => NULL,
+    p_job_name                   => NULL,
+    p_job_run_id                 => NULL   
+   ); 
+
+
+
+INSERT /*+ append */ INTO CSRG_PROD.BPO_TMP_ACCT_MI 
+  (portfolio, 
+   servicing_source, 
+   account_number, 
+   transaction, 
+   new_product, 
+   term, 
+   mi_rate_type, 
+   mi_endorse_dt, 
+   investor_full_name, 
+   new_ufmip_pct, 
+   new_mip_pct
+   )
+ SELECT
+    l.portfolio,
+    l.servicing_source, 
+    l.account_number,
+    l.transaction,
+    l.new_product,
+    l.term,
+    l.mi_rate_type,
+    l.mi_endorse_dt,
+    l.investor_full_name,
+    CASE WHEN m.ufmip_fact  IS NULL 
+          THEN 0 
+         ELSE m.ufmip_fact 
+    END AS new_ufmip_pct,
+    CASE WHEN m.mi_fact    IS NULL 
+          THEN 0 
+         ELSE m.mi_fact      
+    END AS new_mip_pct
+FROM
+    BATCH_PRICING_INPUT l,
+    batch_pricing_mi_factors m
+
+WHERE
+    (l.mort_typ IN ('FHA', 'VA') OR l.new_product LIKE ('%BPMI%') OR (l.new_product LIKE ('%HASP%') AND l.ltv >= 80 AND l.mi_rate_type = 'P'))
+    AND l.prod_cd = m.prod_cd(+)
+    AND l.mi_rate_type = m.rate_type(+)
+    AND
+    (    m.prod_cd IS NULL
+        OR
+        (    m.rate_type = 'A'
+            AND l.ltv BETWEEN m.ltv_from AND m.ltv_to
+             AND l.loan_amt BETWEEN m.loanamt_from AND m.loanamt_to
+         )
+        OR
+        (        m.rate_type = 'D'
+            AND l.ltv BETWEEN m.ltv_from AND m.ltv_to
+            AND l.loan_amt BETWEEN m.loanamt_from AND m.loanamt_to
+            AND l.mi_endorse_dt BETWEEN NVL(m.endorsement_date_from,TO_DATE('01/01/1990','MM/DD/YYYY') )
+            AND NVL(m.endorsement_date_to,    TO_DATE('12/31/2099','MM/DD/YYYY') )
+         )
+        OR -- Added by AT to allow for over 80 LTV PMI pricing on 5/28/2015
+        (        m.rate_type = 'P'
+            AND l.ltv BETWEEN m.ltv_from AND m.ltv_to
+             AND l.loan_amt BETWEEN m.loanamt_from AND m.loanamt_to
+             AND l.mi_endorse_dt BETWEEN NVL(m.endorsement_date_from,TO_DATE('01/01/1990','MM/DD/YYYY') )
+                                     AND NVL(m.endorsement_date_to,    TO_DATE('12/31/2099','MM/DD/YYYY') )
+             AND l.cred_score BETWEEN m.fico_from AND m.fico_to
+             AND l.term BETWEEN m.term_from AND m.term_to --Added by AT to allow filtering by term for PMI 09/15/2016
+         )
+    )
+;
+
+
+v_count := SQL%ROWCOUNT;
+
+
+
+-- 1. Enable Constraints, Validate Indexes On BPO_TMP_ACCT_MI Table .....
+-- =======================================================================================================================================
+    PKG_UTL_OBJMAINTENANCE.prc_enable_idx_constr
+            (p_exec_status_id   => v_exec_status_id, 
+             p_exec_status_txt  => v_exec_status_txt, 
+             p_called_by        => v_prc_nm, 
+             p_load_table_name  => v_tab5_name,
+             p_job_name         => NULL,
+             p_job_run_id       => NULL
+             ); 
+             
+-- 2. Analyze Indexes On BPO_TMP_ACCT_MI Table .....
+-- =======================================================================================================================================            
+    PKG_UTL_OBJMAINTENANCE.prc_analyze_tab
+        (p_table_owner                  => v_tab_owner,
+         p_table_name                   => v_tab5_name, -- 'BPO_TMP_ACCT_MI'
+         p_parallel_degree              => 4, 
+         p_method_opt                   => 'FOR ALL INDEXED COLUMNS SIZE AUTO', 
+         p_partition_yn                 => 'N',
+         p_sub_partition_yn             => 'N',
+         p_min_partition_refresh_year   => NULL,
+         p_max_partition_refresh_year   => NULL,
+         p_job_name                     => NULL,
+         p_job_run_id                   => NULL
+         );  
+
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+
+
+INSERT INTO CSRG_PROD.BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 5:  Refresh BPO_TMP_ACCT_MI Complete.  # Records: ',
+                    v_count,v_tab5_name,v_runtime); -- logfile entry
+COMMIT;
+
+--efalkov
+--------------------------------------------------------------------------------------------------------------
+-- Step 5: Apply Upfront and Monthly MI factors to the FHA product records on BATCH_PRICING_INPUT
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 6:  Update BATCH_PRICING_INPUT with FHA MI Factors',null,null,null); -- logfile entry
+COMMIT;
+
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+-- efalkov merge below causing errors with duplicates
+--MERGE INTO BATCH_PRICING_INPUT BATCH_PRICING
+--USING BPO_TMP_ACCT_MI BPO_TMP
+--ON
+--
+--(
+--    BATCH_PRICING.SERVICING_SOURCE    =BPO_TMP.SERVICING_SOURCE AND
+--    BATCH_PRICING.ACCOUNT_NUMBER      =BPO_TMP.ACCOUNT_NUMBER AND
+--    BATCH_PRICING.TRANSACTION         =BPO_TMP.TRANSACTION AND
+--    BATCH_PRICING.NEW_PRODUCT         =BPO_TMP.NEW_PRODUCT AND
+--    (BATCH_PRICING.MORT_TYP IN ('FHA', 'VA') OR BATCH_PRICING.NEW_PRODUCT LIKE ('%BPMI%') OR (BATCH_PRICING.NEW_PRODUCT LIKE ('%HASP%') AND BATCH_PRICING.LTV >= 80 AND BATCH_PRICING.MI_RATE_TYPE = 'P'))
+--)
+--
+--WHEN MATCHED THEN UPDATE SET
+--
+--    BATCH_PRICING.NEW_UFMIP_PCT = BPO_TMP.NEW_UFMIP_PCT,
+--    BATCH_PRICING.NEW_MIP_PCT   = BPO_TMP.NEW_MIP_PCT
+--
+--;
+
+MERGE INTO  (SELECT * FROM BATCH_PRICING_INPUT BATCH_PRICING
+             WHERE BATCH_PRICING.MORT_TYP IN ('FHA', 'VA') OR BATCH_PRICING.NEW_PRODUCT LIKE ('%BPMI%') 
+                 OR (BATCH_PRICING.NEW_PRODUCT LIKE ('%HASP%') AND BATCH_PRICING.LTV >= 80 AND BATCH_PRICING.MI_RATE_TYPE = 'P')
+             ) BATCH_PRICING            
+      USING 
+      (SELECT DISTINCT BPO_TMP.SERVICING_SOURCE ,BPO_TMP.ACCOUNT_NUMBER,BPO_TMP.TRANSACTION,BPO_TMP.NEW_PRODUCT,BPO_TMP.NEW_UFMIP_PCT,BPO_TMP.NEW_MIP_PCT 
+       FROM BPO_TMP_ACCT_MI BPO_TMP 
+      ) BPO_TMP
+       ON ( BATCH_PRICING.SERVICING_SOURCE    =BPO_TMP.SERVICING_SOURCE AND
+            BATCH_PRICING.ACCOUNT_NUMBER      =BPO_TMP.ACCOUNT_NUMBER AND
+            BATCH_PRICING.TRANSACTION         =BPO_TMP.TRANSACTION AND
+            BATCH_PRICING.NEW_PRODUCT         =BPO_TMP.NEW_PRODUCT)
+  WHEN MATCHED THEN UPDATE SET     
+           BATCH_PRICING.NEW_UFMIP_PCT = BPO_TMP.NEW_UFMIP_PCT,
+           BATCH_PRICING.NEW_MIP_PCT   = BPO_TMP.NEW_MIP_PCT;
+
+v_count := SQL%ROWCOUNT;
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 6:  Update BATCH_PRICING_INPUT with FHA MI Factors Complete. # Records: ',
+                             v_count,v_tab4_name,v_runtime); -- logfile entry
+COMMIT;
+
+
+--------------------------------------------------------------------------------------------------------------
+-- Step 6: Create index, delete unneeded records and temp tables, etc.
+
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 7:  Various Update/DELETE on BATCH_PRICING_INPUT',
+                    null,null,null); -- logfile entry
+COMMIT;
+
+
+-- Update Replaced by merge - works faster E.Falkov
+--ADDED BY AT 9/27/2013 TO APPLY LLPA CAPS FOR HARP PRODUCTS
+--MODIFIED ON 12/15/2015 BY AT
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+--UPDATE BATCH_PRICING_INPUT
+--SET LLPA_CAP =
+--                (CASE WHEN INVESTOR_RESTRICT = 'FANNIE MAE' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD = 'P' AND LTV > 80 THEN
+--                CASE WHEN TERM <= 240 THEN 0 ELSE 0.75 END
+--                WHEN INVESTOR_RESTRICT = 'FANNIE MAE' AND NEW_PRODUCT LIKE ('%HASP%') AND LTV > 105 THEN
+--                CASE WHEN TERM <= 300 THEN 1.5 ELSE 2.00 END
+--                WHEN INVESTOR_RESTRICT = 'FANNIE MAE' AND NEW_PRODUCT LIKE ('%HASP%') AND LTV <= 105 THEN
+--                CASE WHEN TERM <= 300 THEN 2.0 ELSE 2.00 END
+--                WHEN INVESTOR_RESTRICT = 'FREDDIE MAC' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD IN ('P', 'S') AND LTV > 80 THEN
+--                CASE WHEN TERM <= 240 THEN 0 ELSE 0.75 END
+--                WHEN INVESTOR_RESTRICT = 'FREDDIE MAC' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD IN ('I') THEN 2.00
+--                WHEN INVESTOR_RESTRICT = 'FREDDIE MAC' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD IN ('P', 'S') AND LTV <= 80 THEN 2.00
+--                ELSE 99 END);
+
+
+
+v_ddl_smt:='ALTER SESSION ENABLE PARALLEL DML';
+EXECUTE IMMEDIATE v_ddl_smt;
+
+
+MERGE  /*+ parallel(BATCH_PRICING_INPUT,6) append */ INTO BATCH_PRICING_INPUT a
+USING (SELECT (CASE WHEN INVESTOR_RESTRICT = 'FANNIE MAE' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD = 'P' AND LTV > 80 THEN
+                CASE WHEN TERM <= 240 THEN 0 ELSE 0.75 END
+                WHEN INVESTOR_RESTRICT = 'FANNIE MAE' AND NEW_PRODUCT LIKE ('%HASP%') AND LTV > 105 THEN
+                CASE WHEN TERM <= 300 THEN 1.5 ELSE 2.00 END
+                WHEN INVESTOR_RESTRICT = 'FANNIE MAE' AND NEW_PRODUCT LIKE ('%HASP%') AND LTV <= 105 THEN
+                CASE WHEN TERM <= 300 THEN 2.0 ELSE 2.00 END
+                WHEN INVESTOR_RESTRICT = 'FREDDIE MAC' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD IN ('P', 'S') AND LTV > 80 THEN
+                CASE WHEN TERM <= 240 THEN 0 ELSE 0.75 END
+                WHEN INVESTOR_RESTRICT = 'FREDDIE MAC' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD IN ('I') THEN 2.00
+                WHEN INVESTOR_RESTRICT = 'FREDDIE MAC' AND NEW_PRODUCT LIKE ('%HASP%') AND USE_CD IN ('P', 'S') AND LTV <= 80 THEN 2.00
+                ELSE 99 END) AS NEW_LLPA_CAP,
+               ROWID 
+       FROM BATCH_PRICING_INPUT) b
+ON (a.ROWID = b.ROWID)
+WHEN MATCHED THEN UPDATE SET
+    a.LLPA_CAP = b.NEW_LLPA_CAP
+;
+
+v_count := SQL%ROWCOUNT;
+
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 7:  Update BATCH_PRICING_INPUT LLPA_CAP. # Records: ',
+                             v_count,v_tab4_name,v_runtime); -- logfile entry
+COMMIT;
+
+
+v_exec_segment_timestamp := SYSTIMESTAMP;
+
+--Added by AT to remove ineligible transactions/ products
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 7:  Delete ineligible transactions/ products ',
+                             null,null,null); -- logfile entry
+COMMIT;
+
+DELETE FROM BATCH_PRICING_INPUT
+WHERE FN_BPI_QC (PROD_DESCRIPT, TRANSACTION, USE_CD, NUMBER_OF_UNITS, LTV, CRED_SCORE, INVESTOR_FULL_NAME, AM_TYP, PROP_TYP, p_state) <> 'OK';
+
+
+v_count := SQL%ROWCOUNT;
+
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 7:  Delete BATCH_PRICING_INPUT With FN_BPI_QC. # Records: ',
+                             v_count,v_tab4_name,v_runtime); -- logfile entry
+COMMIT;
+
+
+--
+--
+--
+--INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 7:  Analyze table',
+--                    null,v_tab4_name,null); -- logfile entry
+--
+--v_exec_segment_timestamp := SYSTIMESTAMP;                    
+--
+----Analyze Indexes On BATCH_PRICING_INPUT Table .....
+---- =======================================================================================================================================            
+--    PKG_UTL_OBJMAINTENANCE.prc_analyze_tab
+--        (p_table_owner                  => v_tab_owner,
+--         p_table_name                   => v_tab4_name, -- 'BATCH_PRICING_INPUT'
+--         p_parallel_degree              => 4, 
+--         p_method_opt                   => 'FOR ALL INDEXED COLUMNS SIZE AUTO', 
+--         p_partition_yn                 => 'N',
+--         p_sub_partition_yn             => 'N',
+--         p_min_partition_refresh_year   => NULL,
+--         p_max_partition_refresh_year   => NULL,
+--         p_job_name                     => NULL,
+--         p_job_run_id                   => NULL
+--         );  
+--
+--v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_segment_timestamp); 
+--
+--INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Step 7:  Analyze table Completed',
+--                             null,v_tab4_name,v_runtime); -- logfile entry
+--COMMIT;
+
+
+/* TRUNCATE TEMPORARY TABLES*/
+
+--EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_PART2_STEP1 DROP STORAGE'; 
+--
+--EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_PART2_STEP2 DROP STORAGE'; 
+--
+--EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_PART2_STEP3 DROP STORAGE'; 
+--
+--EXECUTE IMMEDIATE 'TRUNCATE TABLE CSRG_PROD.BPO_TMP_ACCT_MI DROP STORAGE'; 
+
+v_runtime:=PKG_UTL_GLOBAL.fun_get_runtime(v_exec_total_segment_timestamp); 
+            
+INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'All Steps Completed', null,null,v_runtime); -- logfile entry
+COMMIT;
+
+EXCEPTION
+WHEN OTHERS THEN
+    --ROLLBACK; 
+    v_err_msg := SQLERRM;  
+    INSERT INTO BATCH_PRICING_LOG VALUES (SYSTIMESTAMP,'Part 2: '||v_prc_nm,'Part 2 Error  ',null, substr(v_err_msg,1,100),null); -- logfile entry
+    COMMIT; 
+     RAISE_APPLICATION_ERROR(-20001,v_err_msg);
+END SP_BP_2_BATCH_PRICING_TRANS;
+/
