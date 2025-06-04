@@ -4,7 +4,7 @@ This repository is a curated collection of code snippets, prototypes, and soluti
 
 ---
 
-## 🔧 Purpose
+## Purpose
 
 This repo serves as a **portfolio reference** and **knowledge base** for demonstrating:
 - How problems were approached across analytics, marketing automation, and data engineering
@@ -13,7 +13,7 @@ This repo serves as a **portfolio reference** and **knowledge base** for demonst
 
 ---
 
-## 📁 Structure
+## Structure
 
 The repo is organized by purpose and language:
 
@@ -26,7 +26,7 @@ The repo is organized by purpose and language:
 
 ---
 
-## 🚀 Featured Examples
+## Featured Examples
 
 - `keyword_analysis.py` – Extracts high-performing keywords using multiple LLM APIs (OpenAI, Gemini, Claude)
 - `address_standardization.py` – Cleans and geocodes addresses via AWS Location Service
@@ -34,19 +34,19 @@ The repo is organized by purpose and language:
 
 ---
 
-## 🔐 Disclaimer
+## Disclaimer
 
 This is a public repository. All credentials or secrets (e.g., API keys) have been removed or masked. If you fork or reuse code, ensure you securely manage your own environment variables and secrets.
 
 ---
 
-## 📜 License
+## License
 
 This repository is shared under the [MIT License](LICENSE). Feel free to use, adapt, or build upon the code with attribution.
 
 ---
 
-## 👋 Author
+## Author
 
 **Anupam Tripathi**  
 Founder – Trinetra LLC  
